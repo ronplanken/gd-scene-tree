@@ -7,7 +7,11 @@ scene organiser from other plugin bundles with one focused dock, without the res
 
 ## Features
 
-- Folders for scenes, nested as deep as you like, with drag and drop.
+- Folders for scenes, nested as deep as you like, with drag and drop. Select
+  several scenes with Ctrl or Shift to move, remove, hide, colour or icon them
+  together.
+- Undo and redo through OBS's own Edit menu and shortcuts, for tree changes as
+  well as adding, removing, renaming and duplicating scenes.
 - Click a scene to select it. In studio mode a click sets the preview and a
   double-click transitions to program. Both can be changed in the settings.
 - The program scene is marked red with a play icon, the preview scene green.
@@ -24,6 +28,8 @@ scene organiser from other plugin bundles with one focused dock, without the res
   keeps its own tree and it travels with an export of the collection.
 - Import and export the tree as JSON. Exported trees reference scenes by name as
   well as by UUID, so they apply on another machine.
+- Public OBS APIs only. Adding and removing scenes goes through the plugin's
+  own dialogs and libobs, not through OBS's private window actions.
 - Migration from StreamUP: if StreamUP's scene organiser data exists for a
   collection that has no tree yet, its folders are imported on first load. The
   settings dialog can repeat that import at any time.

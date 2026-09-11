@@ -42,6 +42,9 @@ gersemi -i CMakeLists.txt
   rows, pills, hover and chevrons itself so the OBS theme cannot draw over them;
   `SceneTreeDock` owns the tree, toolbar, context menu, settings dialog, icon
   picker, persistence and the StreamUP import.
+- Undo and redo use `obs_frontend_add_undo_redo_action`. Tree edits record the
+  layout JSON before and after; scene add, remove, rename and duplicate record
+  their own data, mirroring what OBS does in `OBSBasic_Scenes.cpp`.
 - Scenes are tracked by OBS UUID. Layouts are saved under `gd_scene_tree` in
   the scene collection through the frontend save callback. Global settings live
   in the plugin config file `settings.json`.

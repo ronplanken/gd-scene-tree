@@ -16,6 +16,7 @@
 #include <QSlider>
 #include <QStyledItemDelegate>
 #include <QApplication>
+#include <QItemSelectionModel>
 #include <QDir>
 #include <QDockWidget>
 #include <QDropEvent>
@@ -28,7 +29,6 @@
 #include <QHash>
 #include <QInputDialog>
 #include <QLineEdit>
-#include <QMainWindow>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -235,7 +235,7 @@ protected:
 			text.setAlpha(110);
 		opt.palette.setColor(QPalette::Text, text);
 		opt.palette.setColor(QPalette::HighlightedText, text);
-		itemDelegate(index)->paint(painter, opt, index);
+		itemDelegateForIndex(index)->paint(painter, opt, index);
 
 		if (model()->hasChildren(index)) {
 			QRect branch(opt.rect.left() - indentation(), opt.rect.top(), indentation(), opt.rect.height());
@@ -269,6 +269,53 @@ protected:
 private:
 	QPersistentModelIndex hoverIndex;
 };
+
+class SceneTreeDock;
+static QPointer<SceneTreeDock> dockWidget;
+
+static void layout_undo_redo(const char *data);
+static void scene_add_undo(const char *data);
+static void scene_add_redo(const char *data);
+static void scene_remove_undo(const char *data);
+static void scene_remove_redo(const char *data);
+static void scene_rename_undo(const char *data);
+static void scene_rename_redo(const char *data);
+static void scene_duplicate_undo(const char *data);
+static void scene_duplicate_redo(const char *data);
+
+static bool save_undo_source_enum(obs_scene_t *, obs_sceneitem_t *item, void *p)
+{
+	obs_source_t *source = obs_sceneitem_get_source(item);
+	if (obs_obj_is_private(source) && !obs_source_removed(source))
+		return true;
+	obs_data_array_t *array = static_cast<obs_data_array_t *>(p);
+	const char *name = obs_source_get_name(source);
+	size_t count = obs_data_array_count(array);
+	for (size_t i = 0; i < count; i++) {
+		obs_data_t *stored = obs_data_array_item(array, i);
+		bool same = strcmp(name, obs_data_get_string(stored, "name")) == 0;
+		obs_data_release(stored);
+		if (same)
+			return true;
+	}
+	if (obs_source_is_group(source))
+		obs_scene_enum_items(obs_group_from_source(source), save_undo_source_enum, p);
+	obs_data_t *data = obs_save_source(source);
+	obs_data_array_push_back(array, data);
+	obs_data_release(data);
+	return true;
+}
+
+static void remove_scene_and_prune(obs_source_t *source)
+{
+	obs_source_remove(source);
+	auto prune = [](void *, obs_source_t *scene) {
+		if (strcmp(obs_source_get_id(scene), "scene") == 0)
+			obs_scene_prune_sources(obs_scene_from_source(scene));
+		return true;
+	};
+	obs_enum_scenes(prune, nullptr);
+}
 
 class SceneTreeDock : public QWidget {
 public:
@@ -306,14 +353,18 @@ public:
 		tree->setDropIndicatorShown(true);
 		tree->setDragDropMode(QAbstractItemView::InternalMove);
 		tree->setDefaultDropAction(Qt::MoveAction);
-		tree->setSelectionMode(QAbstractItemView::SingleSelection);
+		tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
 		tree->setContextMenuPolicy(Qt::CustomContextMenu);
 		tree->setIndentation(16);
 		tree->onDropped = [this]() {
 			persist();
 		};
-		connect(tree, &QTreeWidget::itemClicked, this,
-			[this](QTreeWidgetItem *item, int) { activate(item, false); });
+		connect(tree, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item, int) {
+			Qt::KeyboardModifiers mods = QApplication::keyboardModifiers();
+			if (mods & (Qt::ControlModifier | Qt::ShiftModifier | Qt::MetaModifier))
+				return;
+			activate(item, false);
+		});
 		connect(tree, &QTreeWidget::itemDoubleClicked, this,
 			[this](QTreeWidgetItem *item, int) { activate(item, true); });
 		connect(tree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem *item, int) { renamed(item); });
@@ -338,8 +389,8 @@ public:
 		toolbar->setIconSize(QSize(16, 16));
 		toolbar->setFloatable(false);
 		toolbar->setMovable(false);
-		addButton = toolButton("icon-plus", L("AddScene"), [this]() { triggerMainAction("actionAddScene"); });
-		removeButton = toolButton("icon-trash", L("Remove"), [this]() { removeSelectedScene(); });
+		addButton = toolButton("icon-plus", L("AddScene"), [this]() { addScene(); });
+		removeButton = toolButton("icon-trash", L("Remove"), [this]() { removeScenes(selectedScenes()); });
 		filtersButton = toolButton("icon-filter", L("Filters"), [this]() { openSelectedFilters(); });
 		upButton = toolButton("icon-up", L("Basic.MainMenu.Edit.Order.MoveUp"), [this]() { moveSelected(-1); });
 		downButton =
@@ -445,6 +496,7 @@ public:
 		highlightCurrent();
 		applyVisibility();
 		updateToolbar();
+		lastLayoutJson = layoutJson();
 	}
 
 	void applyLayout(obs_data_t *layout)
@@ -463,6 +515,32 @@ public:
 			tree->collapseAll();
 		setLocked(wasLocked, false);
 		syncScenes();
+	}
+
+	QString layoutJson()
+	{
+		obs_data_t *layout = saveLayout();
+		QString json = QString::fromUtf8(obs_data_get_json(layout));
+		obs_data_release(layout);
+		return json;
+	}
+
+	void applyLayoutJson(const QString &json)
+	{
+		obs_data_t *layout = obs_data_create_from_json(json.toUtf8().constData());
+		if (!layout)
+			return;
+		applyLayout(layout);
+		obs_data_release(layout);
+		lastLayoutJson = layoutJson();
+		obs_frontend_save();
+	}
+
+	void recordSceneAction(const QString &name, undo_redo_cb undo, undo_redo_cb redo, const QString &undoData,
+			       const QString &redoData)
+	{
+		obs_frontend_add_undo_redo_action(name.toUtf8().constData(), undo, redo, undoData.toUtf8().constData(),
+						  redoData.toUtf8().constData(), false);
 	}
 
 	obs_data_t *saveLayout()
@@ -510,7 +588,7 @@ public:
 		if (focus && tree->currentItem() != focus) {
 			bool autoScroll = tree->hasAutoScroll();
 			tree->setAutoScroll(false);
-			tree->setCurrentItem(focus);
+			tree->setCurrentItem(focus, 0, QItemSelectionModel::NoUpdate);
 			tree->setAutoScroll(autoScroll);
 		}
 		tree->viewport()->update();
@@ -815,14 +893,6 @@ private:
 		return button;
 	}
 
-	void triggerMainAction(const char *name)
-	{
-		QMainWindow *main = static_cast<QMainWindow *>(obs_frontend_get_main_window());
-		QAction *action = main ? main->findChild<QAction *>(name) : nullptr;
-		if (action)
-			action->trigger();
-	}
-
 	obs_source_t *selectedScene()
 	{
 		QTreeWidgetItem *item = tree->currentItem();
@@ -831,19 +901,206 @@ private:
 		return obs_get_source_by_uuid(item->data(0, ROLE_UUID).toString().toUtf8().constData());
 	}
 
-	void removeSelectedScene()
+	QList<QTreeWidgetItem *> selectedScenes()
 	{
-		obs_source_t *scene = selectedScene();
-		if (!scene)
-			return;
-		if (obs_frontend_preview_program_mode_active())
-			obs_frontend_set_current_preview_scene(scene);
-		else
-			obs_frontend_set_current_scene(scene);
-		obs_source_release(scene);
-		triggerMainAction("actionRemoveScene");
+		QList<QTreeWidgetItem *> scenes;
+		for (QTreeWidgetItem *item : tree->selectedItems()) {
+			if (isScene(item))
+				scenes.append(item);
+		}
+		if (scenes.isEmpty() && isScene(tree->currentItem()))
+			scenes.append(tree->currentItem());
+		return scenes;
 	}
 
+	QList<QTreeWidgetItem *> targetsFor(QTreeWidgetItem *item)
+	{
+		QList<QTreeWidgetItem *> selected = tree->selectedItems();
+		if (selected.size() > 1 && selected.contains(item))
+			return selected;
+		return {item};
+	}
+
+	QString uniqueSceneName(const QString &base)
+	{
+		for (int n = 1;; n++) {
+			QString candidate = n == 1 ? base : QString("%1 %2").arg(base).arg(n);
+			obs_source_t *clash = obs_get_source_by_name(candidate.toUtf8().constData());
+			if (!clash)
+				return candidate;
+			obs_source_release(clash);
+		}
+	}
+
+	bool askSceneName(QString &name)
+	{
+		for (;;) {
+			bool ok = false;
+			name = QInputDialog::getText(this, L("Basic.Main.AddSceneDlg.Title"),
+						     L("Basic.Main.AddSceneDlg.Text"), QLineEdit::Normal, name, &ok)
+				       .trimmed();
+			if (!ok)
+				return false;
+			if (name.isEmpty()) {
+				QMessageBox::warning(this, L("NoNameEntered.Title"), L("NoNameEntered.Text"));
+				continue;
+			}
+			obs_source_t *clash = obs_get_source_by_name(name.toUtf8().constData());
+			if (clash) {
+				obs_source_release(clash);
+				QMessageBox::warning(this, L("NameExists.Title"), L("NameExists.Text"));
+				continue;
+			}
+			return true;
+		}
+	}
+
+	void addScene()
+	{
+		QString name = uniqueSceneName(L("Basic.Scene"));
+		if (!askSceneName(name))
+			return;
+		obs_scene_t *scene = obs_scene_create(name.toUtf8().constData());
+		if (!scene)
+			return;
+		obs_frontend_set_current_scene(obs_scene_get_source(scene));
+		obs_scene_release(scene);
+		recordSceneAction(L("Undo.Add").arg(name), scene_add_undo, scene_add_redo, name, name);
+	}
+
+	void removeScenes(const QList<QTreeWidgetItem *> &items)
+	{
+		if (items.isEmpty() || locked)
+			return;
+		QString question = items.size() == 1 ? L("ConfirmRemove.Text").arg(items.first()->text(0))
+						     : L("ConfirmRemove.TextMultiple").arg(items.size());
+		QMessageBox::StandardButton answer = QMessageBox::question(
+			this, L("ConfirmRemove.Title"), question, QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+		if (answer != QMessageBox::Yes)
+			return;
+		QStringList uuids;
+		for (QTreeWidgetItem *item : items)
+			uuids.append(item->data(0, ROLE_UUID).toString());
+		for (const QString &uuid : uuids) {
+			obs_source_t *scene = obs_get_source_by_uuid(uuid.toUtf8().constData());
+			if (scene)
+				removeSceneWithUndo(scene);
+			obs_source_release(scene);
+		}
+	}
+
+	void removeSceneWithUndo(obs_source_t *source)
+	{
+		obs_scene_t *scene = obs_scene_from_source(source);
+		QString name = obs_source_get_name(source);
+
+		obs_data_array_t *inScene = obs_data_array_create();
+		obs_scene_enum_items(scene, save_undo_source_enum, inScene);
+		obs_data_t *sceneData = obs_save_source(source);
+		obs_data_array_push_back(inScene, sceneData);
+		obs_data_release(sceneData);
+
+		obs_data_array_t *usedIn = obs_data_array_create();
+		struct Ctx {
+			obs_source_t *removed;
+			obs_data_array_t *usedIn;
+		} ctx = {source, usedIn};
+		auto collect = [](void *ptr, obs_source_t *other) {
+			Ctx *c = static_cast<Ctx *>(ptr);
+			if (strcmp(obs_source_get_name(other), obs_source_get_name(c->removed)) == 0)
+				return true;
+			obs_sceneitem_t *item = obs_scene_find_source(obs_group_or_scene_from_source(other),
+								      obs_source_get_name(c->removed));
+			if (item) {
+				obs_data_t *data = obs_save_source(obs_scene_get_source(obs_sceneitem_get_scene(item)));
+				obs_data_array_push_back(c->usedIn, data);
+				obs_data_release(data);
+			}
+			return true;
+		};
+		obs_enum_scenes(collect, &ctx);
+
+		obs_data_t *undoData = obs_data_create();
+		obs_data_set_array(undoData, "sources_in_deleted_scene", inScene);
+		obs_data_set_array(undoData, "scene_used_in_other_scenes", usedIn);
+		obs_data_set_string(undoData, "layout", layoutJson().toUtf8().constData());
+		obs_data_array_release(inScene);
+		obs_data_array_release(usedIn);
+
+		remove_scene_and_prune(source);
+		syncScenes();
+
+		obs_data_t *redoData = obs_data_create();
+		obs_data_set_string(redoData, "name", name.toUtf8().constData());
+		obs_data_set_string(redoData, "layout", layoutJson().toUtf8().constData());
+
+		recordSceneAction(L("Undo.Delete").arg(name), scene_remove_undo, scene_remove_redo,
+				  obs_data_get_json(undoData), obs_data_get_json(redoData));
+		obs_data_release(undoData);
+		obs_data_release(redoData);
+	}
+
+public:
+	void restoreRemovedScene(const char *json)
+	{
+		obs_data_t *base = obs_data_create_from_json(json);
+		if (!base)
+			return;
+		obs_data_array_t *inScene = obs_data_get_array(base, "sources_in_deleted_scene");
+		obs_data_array_t *usedIn = obs_data_get_array(base, "scene_used_in_other_scenes");
+
+		QList<obs_source_t *> created;
+		size_t count = obs_data_array_count(inScene);
+		for (size_t i = 0; i < count; i++) {
+			obs_data_t *data = obs_data_array_item(inScene, i);
+			obs_source_t *existing = obs_get_source_by_name(obs_data_get_string(data, "name"));
+			if (existing)
+				obs_source_release(existing);
+			else
+				created.append(obs_load_source(data));
+			obs_data_release(data);
+		}
+		for (obs_source_t *source : created)
+			obs_source_load2(source);
+
+		size_t usedCount = obs_data_array_count(usedIn);
+		for (size_t i = 0; i < usedCount; i++) {
+			obs_data_t *data = obs_data_array_item(usedIn, i);
+			obs_source_t *other = obs_get_source_by_name(obs_data_get_string(data, "name"));
+			if (other) {
+				obs_data_t *settings = obs_data_get_obj(data, "settings");
+				obs_data_array_t *items = obs_data_get_array(settings, "items");
+				QList<obs_source_t *> keep;
+				auto clear = [](obs_scene_t *, obs_sceneitem_t *item, void *ptr) {
+					QList<obs_source_t *> *list = static_cast<QList<obs_source_t *> *>(ptr);
+					obs_source_t *src = obs_sceneitem_get_source(item);
+					list->append(obs_source_get_ref(src));
+					obs_sceneitem_remove(item);
+					return true;
+				};
+				obs_scene_enum_items(obs_group_or_scene_from_source(other), clear, &keep);
+				obs_sceneitems_add(obs_group_or_scene_from_source(other), items);
+				for (obs_source_t *src : keep)
+					obs_source_release(src);
+				obs_data_array_release(items);
+				obs_data_release(settings);
+				obs_source_release(other);
+			}
+			obs_data_release(data);
+		}
+
+		if (!created.isEmpty())
+			obs_frontend_set_current_scene(created.last());
+		for (obs_source_t *source : created)
+			obs_source_release(source);
+
+		obs_data_array_release(inScene);
+		obs_data_array_release(usedIn);
+		applyLayoutJson(QString::fromUtf8(obs_data_get_string(base, "layout")));
+		obs_data_release(base);
+	}
+
+private:
 	void openSelectedFilters()
 	{
 		obs_source_t *scene = selectedScene();
@@ -935,7 +1192,27 @@ private:
 		moveItemTo(item, parent->indexOfChild(item) + direction);
 	}
 
-	void moveSelected(int direction) { moveItem(tree->currentItem(), direction); }
+	void moveSelected(int direction)
+	{
+		QList<QTreeWidgetItem *> selected = tree->selectedItems();
+		if (selected.isEmpty()) {
+			moveItem(tree->currentItem(), direction);
+			return;
+		}
+		std::sort(selected.begin(), selected.end(), [](QTreeWidgetItem *a, QTreeWidgetItem *b) {
+			QTreeWidgetItem *pa = a->parent();
+			QTreeWidgetItem *pb = b->parent();
+			int ia = pa ? pa->indexOfChild(a) : a->treeWidget()->indexOfTopLevelItem(a);
+			int ib = pb ? pb->indexOfChild(b) : b->treeWidget()->indexOfTopLevelItem(b);
+			return ia < ib;
+		});
+		if (direction > 0)
+			std::reverse(selected.begin(), selected.end());
+		for (QTreeWidgetItem *item : selected)
+			moveItem(item, direction);
+		for (QTreeWidgetItem *item : selected)
+			item->setSelected(true);
+	}
 
 	void placeAfter(QTreeWidgetItem *item, QTreeWidgetItem *anchor)
 	{
@@ -985,6 +1262,7 @@ private:
 			if (clash) {
 				obs_source_release(clash);
 			} else {
+				QString before = layoutJson();
 				obs_scene_t *copy = obs_scene_duplicate(obs_scene_from_source(scene),
 									name.toUtf8().constData(), OBS_SCENE_DUP_REFS);
 				if (copy) {
@@ -995,7 +1273,19 @@ private:
 					if (settings.switchOnDuplicate)
 						obs_frontend_set_current_scene(copySource);
 					obs_scene_release(copy);
-					persist();
+					persist(false);
+					obs_data_t *undoData = obs_data_create();
+					obs_data_set_string(undoData, "copy", name.toUtf8().constData());
+					obs_data_set_string(undoData, "layout", before.toUtf8().constData());
+					obs_data_t *redoData = obs_data_create();
+					obs_data_set_string(redoData, "original", base.toUtf8().constData());
+					obs_data_set_string(redoData, "copy", name.toUtf8().constData());
+					obs_data_set_string(redoData, "layout", layoutJson().toUtf8().constData());
+					recordSceneAction(L("Undo.Scene.Duplicate").arg(name), scene_duplicate_undo,
+							  scene_duplicate_redo, obs_data_get_json(undoData),
+							  obs_data_get_json(redoData));
+					obs_data_release(undoData);
+					obs_data_release(redoData);
 				}
 			}
 		}
@@ -1101,7 +1391,8 @@ private:
 	void setItemColor(QTreeWidgetItem *item, const QString &hex)
 	{
 		applying = true;
-		item->setData(0, ROLE_COLOR, hex);
+		for (QTreeWidgetItem *target : targetsFor(item))
+			target->setData(0, ROLE_COLOR, hex);
 		applying = false;
 		tree->viewport()->update();
 		persist();
@@ -1324,9 +1615,11 @@ private:
 		if (!cleared && grid->currentItem())
 			chosen = grid->currentItem()->data(Qt::UserRole).toString();
 		applying = true;
-		item->setData(0, ROLE_ICON, chosen);
+		for (QTreeWidgetItem *target : targetsFor(item)) {
+			target->setData(0, ROLE_ICON, chosen);
+			applyItemIcon(target);
+		}
 		applying = false;
-		applyItemIcon(item);
 		persist();
 	}
 
@@ -1613,6 +1906,16 @@ private:
 				applying = false;
 			} else {
 				obs_source_set_name(scene, name.toUtf8().constData());
+				obs_data_t *undoData = obs_data_create();
+				obs_data_set_string(undoData, "from", name.toUtf8().constData());
+				obs_data_set_string(undoData, "to", current.toUtf8().constData());
+				obs_data_t *redoData = obs_data_create();
+				obs_data_set_string(redoData, "from", current.toUtf8().constData());
+				obs_data_set_string(redoData, "to", name.toUtf8().constData());
+				recordSceneAction(L("Undo.Rename").arg(name), scene_rename_undo, scene_rename_redo,
+						  obs_data_get_json(undoData), obs_data_get_json(redoData));
+				obs_data_release(undoData);
+				obs_data_release(redoData);
 			}
 		}
 		obs_source_release(scene);
@@ -1644,7 +1947,7 @@ private:
 			tree->setCurrentItem(item);
 		QMenu menu(this);
 
-		menu.addAction(L("AddScene"), this, [this]() { triggerMainAction("actionAddScene"); });
+		menu.addAction(L("AddScene"), this, [this]() { addScene(); });
 		addFolderAction(menu, item);
 
 		if (isScene(item)) {
@@ -1678,10 +1981,22 @@ private:
 			QAction *rename =
 				menu.addAction(L("Rename"), this, [this, item]() { tree->editItem(item, 0); });
 			rename->setEnabled(!locked);
-			QAction *remove = menu.addAction(L("Remove"), this, [this]() { removeSelectedScene(); });
+			QAction *remove = menu.addAction(L("Remove"), this, [this, item]() {
+				QList<QTreeWidgetItem *> targets;
+				for (QTreeWidgetItem *t : targetsFor(item)) {
+					if (isScene(t))
+						targets.append(t);
+				}
+				removeScenes(targets);
+			});
 			remove->setEnabled(!locked);
 			QAction *hide = menu.addAction(hidden ? T("UnhideScene") : T("HideScene"), this,
-						       [this, item, hidden]() { setSceneHidden(item, !hidden); });
+						       [this, item, hidden]() {
+							       for (QTreeWidgetItem *t : targetsFor(item)) {
+								       if (isScene(t))
+									       setSceneHidden(t, !hidden);
+							       }
+						       });
 			hide->setEnabled(!locked);
 
 			menu.addSeparator();
@@ -1809,10 +2124,14 @@ private:
 		tree->viewport()->update();
 	}
 
-	void persist()
+	void persist(bool record = true)
 	{
 		if (applying || detached)
 			return;
+		QString json = layoutJson();
+		if (record && !lastLayoutJson.isEmpty() && json != lastLayoutJson)
+			recordSceneAction(T("Undo.Tree"), layout_undo_redo, layout_undo_redo, lastLayoutJson, json);
+		lastLayoutJson = json;
 		obs_frontend_save();
 	}
 
@@ -1820,7 +2139,7 @@ private:
 	{
 		if (applying || detached)
 			return;
-		QMetaObject::invokeMethod(this, [this]() { persist(); }, Qt::QueuedConnection);
+		QMetaObject::invokeMethod(this, [this]() { persist(false); }, Qt::QueuedConnection);
 	}
 
 	QLineEdit *search = nullptr;
@@ -1842,6 +2161,7 @@ private:
 	QIcon expandIcon;
 	QIcon gearIcon;
 	QString filterClipboard;
+	QString lastLayoutJson;
 	QHash<QString, QIcon> iconCache;
 	TreeSettings settings;
 	RowDelegate *delegate = nullptr;
@@ -1850,7 +2170,104 @@ private:
 	bool detached = false;
 };
 
-static QPointer<SceneTreeDock> dockWidget;
+static void layout_undo_redo(const char *data)
+{
+	if (dockWidget)
+		dockWidget->applyLayoutJson(QString::fromUtf8(data));
+}
+
+static void scene_add_undo(const char *name)
+{
+	obs_source_t *source = obs_get_source_by_name(name);
+	if (source)
+		obs_source_remove(source);
+	obs_source_release(source);
+}
+
+static void scene_add_redo(const char *name)
+{
+	obs_scene_t *scene = obs_scene_create(name);
+	if (!scene)
+		return;
+	obs_frontend_set_current_scene(obs_scene_get_source(scene));
+	obs_scene_release(scene);
+}
+
+static void scene_remove_undo(const char *data)
+{
+	if (dockWidget)
+		dockWidget->restoreRemovedScene(data);
+}
+
+static void scene_remove_redo(const char *data)
+{
+	obs_data_t *redo = obs_data_create_from_json(data);
+	if (!redo)
+		return;
+	obs_source_t *source = obs_get_source_by_name(obs_data_get_string(redo, "name"));
+	if (source)
+		remove_scene_and_prune(source);
+	obs_source_release(source);
+	if (dockWidget)
+		dockWidget->applyLayoutJson(QString::fromUtf8(obs_data_get_string(redo, "layout")));
+	obs_data_release(redo);
+}
+
+static void rename_from_json(const char *data)
+{
+	obs_data_t *names = obs_data_create_from_json(data);
+	if (!names)
+		return;
+	obs_source_t *source = obs_get_source_by_name(obs_data_get_string(names, "from"));
+	if (source)
+		obs_source_set_name(source, obs_data_get_string(names, "to"));
+	obs_source_release(source);
+	obs_data_release(names);
+}
+
+static void scene_rename_undo(const char *data)
+{
+	rename_from_json(data);
+}
+
+static void scene_rename_redo(const char *data)
+{
+	rename_from_json(data);
+}
+
+static void scene_duplicate_undo(const char *data)
+{
+	obs_data_t *undo = obs_data_create_from_json(data);
+	if (!undo)
+		return;
+	obs_source_t *copy = obs_get_source_by_name(obs_data_get_string(undo, "copy"));
+	if (copy)
+		remove_scene_and_prune(copy);
+	obs_source_release(copy);
+	if (dockWidget)
+		dockWidget->applyLayoutJson(QString::fromUtf8(obs_data_get_string(undo, "layout")));
+	obs_data_release(undo);
+}
+
+static void scene_duplicate_redo(const char *data)
+{
+	obs_data_t *redo = obs_data_create_from_json(data);
+	if (!redo)
+		return;
+	obs_source_t *original = obs_get_source_by_name(obs_data_get_string(redo, "original"));
+	if (original) {
+		obs_scene_t *copy = obs_scene_duplicate(obs_scene_from_source(original),
+							obs_data_get_string(redo, "copy"), OBS_SCENE_DUP_REFS);
+		if (copy) {
+			obs_frontend_set_current_scene(obs_scene_get_source(copy));
+			obs_scene_release(copy);
+		}
+	}
+	obs_source_release(original);
+	if (dockWidget)
+		dockWidget->applyLayoutJson(QString::fromUtf8(obs_data_get_string(redo, "layout")));
+	obs_data_release(redo);
+}
 
 void scene_tree_dock_register()
 {
