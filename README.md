@@ -49,6 +49,21 @@ Download the package for your platform from the
 OBS Studio 31 or newer is required. Restart OBS after installing. The dock
 appears as **GD Scene Tree**; enable it from the **Docks** menu if it is hidden.
 
+### Unsigned packages
+
+The packages are not code signed, so both Windows and macOS warn on first run.
+The files are built by GitHub Actions from the tagged source; compare the
+SHA-256 in the release notes if you want to check a download.
+
+**Windows.** SmartScreen shows "Windows protected your PC". Click **More info**,
+then **Run anyway**. The UAC prompt lists the publisher as unknown; the file
+properties show Ron Planken as the company.
+
+**macOS.** Opening the pkg shows "Apple could not verify" with no option to
+continue. Click **Done**, open **System Settings**, go to **Privacy & Security**,
+scroll down to the message about the blocked package and click **Open Anyway**.
+On macOS 13 and 14 you can instead right-click the pkg and choose **Open**.
+
 ## Usage
 
 - Right-click anywhere in the tree for the context menu. Right-click empty space
@@ -80,8 +95,13 @@ Every push builds all three platforms. Pushing a tag of the form `1.2.3` also
 packages them, builds the Windows installer, and creates a GitHub release with
 the installer, the zip, the macOS package and the Ubuntu package attached.
 
-macOS packages are only signed and notarised when the signing secrets from the
-plugin template are configured in the repository.
+The release is created as a draft with the SHA-256 checksums in its notes.
+Review it on GitHub and publish it by hand.
+
+Packages are not code signed. The macOS build is ad-hoc signed so it loads on
+Apple Silicon, and the Windows installer and plugin carry the author name in
+their version information. Signing and notarisation switch on automatically if
+the signing secrets from the OBS plugin template are added to the repository.
 
 ## Licence
 
