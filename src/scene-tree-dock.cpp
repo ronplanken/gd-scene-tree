@@ -1227,6 +1227,14 @@ private:
 		applying = false;
 	}
 
+	int countDescendants(QTreeWidgetItem *item)
+	{
+		int total = 0;
+		for (int i = 0; i < item->childCount(); i++)
+			total += 1 + countDescendants(item->child(i));
+		return total;
+	}
+
 	QTreeWidgetItem *findSceneItem(const QString &uuid)
 	{
 		QTreeWidgetItemIterator it(tree);
@@ -2054,6 +2062,15 @@ private:
 				menu.addAction(L("Rename"), this, [this, item]() { tree->editItem(item, 0); });
 			rename->setEnabled(!locked);
 			QAction *remove = menu.addAction(T("DeleteFolder"), this, [this, item]() {
+				int contents = countDescendants(item);
+				if (contents > 0) {
+					QMessageBox::StandardButton answer = QMessageBox::question(
+						this, T("DeleteFolder"),
+						QString(T("DeleteFolder.Confirm")).arg(item->text(0)).arg(contents),
+						QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+					if (answer != QMessageBox::Yes)
+						return;
+				}
 				QTreeWidgetItem *parent = item->parent() ? item->parent() : tree->invisibleRootItem();
 				int index = parent->indexOfChild(item);
 				while (item->childCount() > 0) {
